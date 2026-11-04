@@ -1,0 +1,9 @@
+anthropic>=0.40.0
+neuralwatch-splunk
+fastapi
+uvicorn
+python-multipart
+opencv-python-headless
+scipy
+numpy
+python-dotenv
