@@ -1,0 +1,89 @@
+"""Lunar Safety Mapper: API + web app.
+
+Run:  uvicorn main:app --reload      then open http://127.0.0.1:8000
+API docs: http://127.0.0.1:8000/docs
+"""
+from pathlib import Path
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+import analyst
+import pipeline
+
+app = FastAPI(title="Lunar Safety Mapper")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+STATE: dict = {"result": None}
+INDEX = Path(__file__).parent / "static" / "index.html"
+
+
+class Question(BaseModel):
+    question: str
+
+
+def _run(photo, dem, temp, w_hazard, w_slope, w_sun, w_temp, mpp, relief_m, dispersion_m=100.0):
+    weights = {"hazard": w_hazard, "slope": w_slope, "sun": w_sun, "temp": w_temp}
+    try:
+        STATE["result"] = pipeline.analyze(photo, dem, temp, weights, mpp=mpp, relief_m=relief_m,
+                                         dispersion_m=dispersion_m)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return STATE["result"]
+
+
+@app.get("/")
+def home():
+    return FileResponse(INDEX)
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "telemetry": analyst.TELEMETRY_ON}
+
+
+@app.post("/analyze")
+async def analyze(photo: UploadFile = File(...), dem: UploadFile | None = File(None),
+                  temp: UploadFile | None = File(None),
+                  w_hazard: float = Form(0.40), w_slope: float = Form(0.25),
+                  w_sun: float = Form(0.20), w_temp: float = Form(0.15),
+                  mpp: float = Form(5.0), relief_m: float = Form(300.0),
+                  dispersion_m: float = Form(100.0)):
+    return _run(await photo.read(), await dem.read() if dem else None, await temp.read() if temp else None,
+                w_hazard, w_slope, w_sun, w_temp, mpp, relief_m, dispersion_m)
+
+
+@app.post("/analyze-sample")
+def analyze_sample(w_hazard: float = Form(0.40), w_slope: float = Form(0.25),
+                   w_sun: float = Form(0.20), w_temp: float = Form(0.15),
+                   dispersion_m: float = Form(100.0)):
+    photo, dem, temp = pipeline.make_sample()
+    return _run(photo, dem, temp, w_hazard, w_slope, w_sun, w_temp, 5.0, 300.0, dispersion_m)
+
+
+@app.get("/sites")
+def sites():
+    if not STATE["result"]:
+        raise HTTPException(404, "No tile analyzed yet.")
+    return STATE["result"]["sites"]
+
+
+@app.post("/ask")
+def ask(body: Question):
+    if not STATE["result"]:
+        raise HTTPException(409, "Analyze a tile first.")
+    try:
+        return {"answer": analyst.ask_analyst(body.question, STATE["result"]["sites"], STATE["result"].get("route"))}
+    except Exception as e:  # missing API key, network, etc.
+        raise HTTPException(502, f"Analyst unavailable: {e}")
+
+
+@app.get("/watch")
+def watch():
+    calls = analyst.CALLS
+    n = len(calls)
+    return {"telemetry_to_splunk": analyst.TELEMETRY_ON, "calls": n,
+            "avg_latency_ms": round(sum(c["latency_ms"] for c in calls) / n) if n else None,
+            "avg_tokens": round(sum(c["input_tokens"] + c["output_tokens"] for c in calls) / n) if n else None,
+            "recent": calls[-10:][::-1]}
